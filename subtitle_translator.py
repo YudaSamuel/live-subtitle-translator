@@ -1,12 +1,13 @@
 """
-Oyun Altyazı Çevirmeni
-----------------------
-Bilgisayarın ses çıkışını (hoparlör / kulaklık) dinler, konuşmayı algılar,
-dilini otomatik tanır ve Türkçe altyazı olarak ekranın altında gösterir.
+Live Subtitle Translator
+------------------------
+Listens to your PC's audio output (speakers / headphones), detects speech,
+identifies its language automatically and shows a translated subtitle at the
+bottom of the screen (Turkish by default).
 
-  Ses (WASAPI loopback) -> Silero VAD -> faster-whisper (GPU) -> NLLB-200 (CPU) -> Overlay
+  Audio (WASAPI loopback) -> Silero VAD -> faster-whisper (GPU) -> NLLB-200 (GPU) -> Overlay
 
-Tamamen yerel çalışır, internete veri gönderilmez.
+Everything runs locally; no data leaves your machine.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ MODELS_DIR = ROOT / "models"
 
 
 # --------------------------------------------------------------------------- #
-#  CUDA DLL'lerini (pip ile kurulan nvidia-cublas / nvidia-cudnn) bul
+#  Make the pip-installed CUDA DLLs (nvidia-cublas / nvidia-cudnn) loadable
 # --------------------------------------------------------------------------- #
 def _register_cuda_dlls() -> None:
     for sp in site.getsitepackages():
@@ -41,7 +42,7 @@ _register_cuda_dlls()
 
 import numpy as np  # noqa: E402
 
-from languages import to_nllb  # noqa: E402
+from languages import nllb_to_whisper, to_nllb  # noqa: E402
 
 TARGET_SR = 16000
 
@@ -56,7 +57,7 @@ def load_config() -> dict:
 
 
 # --------------------------------------------------------------------------- #
-#  1) Ses yakalama — varsayılan çıkış cihazının loopback'i
+#  1) Audio capture — loopback of the default output device
 # --------------------------------------------------------------------------- #
 class LoopbackCapture:
     def __init__(self, out_queue: "queue.Queue[np.ndarray]", device_name: str | None = None):
@@ -74,7 +75,7 @@ class LoopbackCapture:
             for dev in self.pa.get_loopback_device_info_generator():
                 if name.lower() in dev["name"].lower():
                     return dev
-            log(f"'{name}' bulunamadı, varsayılan çıkış kullanılacak.")
+            log(f"Device '{name}' not found, using the default output.")
         return self.pa.get_default_wasapi_loopback()
 
     def _callback(self, in_data, frame_count, time_info, status):
@@ -89,7 +90,7 @@ class LoopbackCapture:
     def start(self) -> None:
         import pyaudiowpatch as pyaudio
 
-        log(f"Ses kaynağı: {self.device['name']}  ({self.rate} Hz, {self.channels} kanal)")
+        log(f"Audio source: {self.device['name']}  ({self.rate} Hz, {self.channels} channels)")
         self.stream = self.pa.open(
             format=pyaudio.paFloat32,
             channels=self.channels,
@@ -113,7 +114,7 @@ def resample(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
         return audio.astype(np.float32)
     ratio = src_sr / dst_sr
     if ratio.is_integer():
-        # Basit alçak geçiren filtre (ortalama) + seyreltme
+        # Simple low-pass (box average) + decimation
         n = int(ratio)
         usable = len(audio) - len(audio) % n
         return audio[:usable].reshape(-1, n).mean(axis=1).astype(np.float32)
@@ -124,7 +125,7 @@ def resample(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
 
 
 # --------------------------------------------------------------------------- #
-#  2) Konuşma bölütleme — Silero VAD ile cümle sonlarını bul
+#  2) Segmentation — find sentence boundaries with Silero VAD
 # --------------------------------------------------------------------------- #
 class Segmenter(threading.Thread):
     def __init__(self, cfg: dict, audio_q: queue.Queue, seg_q: queue.Queue, stop: threading.Event,
@@ -144,15 +145,15 @@ class Segmenter(threading.Thread):
         self.min_len = int(cfg["min_segment_seconds"] * TARGET_SR)
         self.pad = int(0.2 * TARGET_SR)
         self.audio_q, self.seg_q, self.stop_ev = audio_q, seg_q, stop
-        # Canlı (ara) altyazı: konuşma sürerken belirli aralıklarla o ana kadarkini çevir
+        # Live (partial) subtitles: while someone is talking, periodically translate what's been said so far
         self.partial_interval = cfg.get("partial_interval_seconds", 0.8)
         self.partial_min = int(cfg.get("partial_min_seconds", 1.0) * TARGET_SR)
-        self.asr_busy = asr_busy or threading.Event()  # Transcriber çalışırken set edilir
+        self.asr_busy = asr_busy or threading.Event()  # set while the Transcriber is working
 
     def _emit(self, audio: np.ndarray) -> None:
         if len(audio) >= self.min_len:
-            if os.environ.get("ALTYAZI_DEBUG"):
-                log(f"   [kesin parça gönderildi, {len(audio) / TARGET_SR:.2f}s ses]")
+            if os.environ.get("SUBTITLE_DEBUG"):
+                log(f"   [final segment sent, {len(audio) / TARGET_SR:.2f}s of audio]")
             self.seg_q.put(("final", audio))
 
     def _maybe_partial(self, audio: np.ndarray) -> None:
@@ -179,25 +180,25 @@ class Segmenter(threading.Thread):
                 continue
             last_check = time.monotonic()
 
-            # Çok sessiz ses için VAD çalıştırmaya gerek yok
+            # No need to run VAD on near-silence
             if np.abs(buf).max() < 1e-3:
                 buf = buf[-TARGET_SR:]
                 continue
 
             speech = self._get_ts(buf, self.vad_opts)
             if not speech:
-                buf = buf[-TARGET_SR:]  # konuşma başlangıcını kaçırmamak için 1 sn tut
+                buf = buf[-TARGET_SR:]  # keep 1 s so we don't miss the start of speech
                 continue
 
             start = max(0, speech[0]["start"] - self.pad)
             end_of_speech = speech[-1]["end"]
 
             if len(buf) - end_of_speech >= self.min_silence:
-                # Cümle bitti
+                # Sentence finished
                 self._emit(buf[start:min(len(buf), end_of_speech + self.pad)])
                 buf = buf[end_of_speech:]
             elif len(buf) - start >= self.max_len:
-                # Çok uzun konuşma: mümkünse iki konuşma arasındaki boşluktan kes
+                # Very long speech: cut at a gap between utterances if possible
                 cut = speech[-2]["end"] if len(speech) > 1 else len(buf)
                 self._emit(buf[start:cut])
                 buf = buf[cut:]
@@ -205,16 +206,16 @@ class Segmenter(threading.Thread):
                 trailing_silence = len(buf) - end_of_speech
                 if start > 0:
                     buf = buf[start:]
-                # Konuşma gerçekten sürüyorsa ara altyazı üret; susmaya başladıysa
-                # kesin çeviriyi geciktirmemek için bekle
+                # Only produce a partial while speech is actually ongoing; once the speaker
+                # has gone quiet, wait for the final segment instead of delaying it
                 if trailing_silence < int(0.15 * TARGET_SR):
                     self._maybe_partial(buf)
 
 
 # --------------------------------------------------------------------------- #
-#  3) Konuşma tanıma — faster-whisper (dil otomatik)
+#  3) Speech recognition — faster-whisper with automatic language detection
 # --------------------------------------------------------------------------- #
-# Whisper'ın sessizlik/müzik üzerinde uydurduğu bilinen kalıplar (YouTube altyazı imzaları vb.)
+# Known Whisper hallucinations on silence/music (YouTube subtitle credits etc.)
 HALLUCINATIONS = re.compile(
     r"(thank(s| you) for watching|(please|and) subscribe|subtitles by|amara\.org|altyazı|"
     r"untertitel|sous-titres|sottotitoli|subtítulos|legendas|napisy|"
@@ -229,16 +230,15 @@ class Transcriber(threading.Thread):
                  busy: threading.Event | None = None):
         super().__init__(daemon=True, name="transcriber")
         from faster_whisper import WhisperModel
+        from faster_whisper.audio import pad_or_trim
+        from faster_whisper.tokenizer import Tokenizer
+        from faster_whisper.transcribe import get_compression_ratio, get_suppressed_tokens
 
         self.busy = busy or threading.Event()
         self.beam = cfg.get("whisper_beam_size", 3)
         self.last_lang: str | None = None
         self.allowed = set(cfg.get("allowed_languages") or [])
         self.min_lang_prob = cfg.get("min_language_probability", 0.3)
-
-        from faster_whisper.audio import pad_or_trim
-        from faster_whisper.tokenizer import Tokenizer
-        from faster_whisper.transcribe import get_compression_ratio, get_suppressed_tokens
 
         self._pad_or_trim = pad_or_trim
         self._compression_ratio = get_compression_ratio
@@ -248,7 +248,7 @@ class Transcriber(threading.Thread):
         )
         self._suppress = lambda tok: get_suppressed_tokens(tok, [-1])
 
-        log(f"Whisper modeli yükleniyor: {cfg['whisper_model']} ({cfg['whisper_device']}) ...")
+        log(f"Loading Whisper model: {cfg['whisper_model']} ({cfg['whisper_device']}) ...")
         local = ROOT / cfg["whisper_model"]
         self.model = WhisperModel(
             str(local) if local.is_dir() else cfg["whisper_model"],
@@ -258,9 +258,9 @@ class Transcriber(threading.Thread):
         )
         self.force_lang = cfg.get("force_source_language")
         self.seg_q, self.text_q, self.stop_ev = seg_q, text_q, stop
-        # Isınma: ilk çağrıdaki gecikmeyi oyuna yansıtmamak için
+        # Warm-up so the first real call isn't slow
         list(self.model.transcribe(np.zeros(TARGET_SR, dtype=np.float32), language="en")[0])
-        log("Whisper hazır.")
+        log("Whisper ready.")
 
     def run(self) -> None:
         while not self.stop_ev.is_set():
@@ -268,7 +268,7 @@ class Transcriber(threading.Thread):
                 kind, audio = self.seg_q.get(timeout=0.2)
             except queue.Empty:
                 continue
-            # Arkada kesin (final) bir parça bekliyorsa eski ara parçayı atla
+            # If something newer is already waiting, skip this stale partial
             if kind == "partial" and not self.seg_q.empty():
                 continue
             self.busy.set()
@@ -278,16 +278,17 @@ class Transcriber(threading.Thread):
                 self.busy.clear()
 
     def _choose_language(self, encoder_output) -> tuple[str, float]:
-        """Dili algıla; kısa/gürültülü parçalarda dilin zıplamasını engelle."""
+        """Detect the language, keeping it stable on short/noisy segments."""
         if self.force_lang:
             return self.force_lang, 1.0
         results = self.model.model.detect_language(encoder_output)[0]
         probs = {tok[2:-2]: p for tok, p in results}
         if self.allowed:
-            # Kullanıcı olası dilleri sınırladıysa sadece onların arasından seç
+            # If the user restricted the possible languages, only pick among those
             probs = {k: v for k, v in probs.items() if k in self.allowed} or probs
         top = max(probs, key=probs.get)
-        # Yapışkanlık: önceki dil hâlâ makul olasılıktaysa ve yeni dil çok emin değilse önceki dilde kal
+        # Stickiness: stay with the previous language if it's still plausible
+        # and the new one isn't a confident switch
         if (
             self.last_lang
             and top != self.last_lang
@@ -300,13 +301,13 @@ class Transcriber(threading.Thread):
     def _process(self, kind: str, audio: np.ndarray) -> None:
         partial = kind == "partial"
         t0 = time.perf_counter()
-        # Tek encoder geçişi: aynı çıktı hem dil algılamada hem metin çıkarmada kullanılır.
-        # (faster-whisper'ın transcribe()'ı dil algılama için encoder'ı ikinci kez çalıştırır.)
+        # Single encoder pass reused for both language detection and decoding.
+        # (faster-whisper's transcribe() runs the encoder a second time to detect the language.)
         m = self.model
         feats = self._pad_or_trim(m.feature_extractor(audio[: 30 * TARGET_SR]))
         enc = m.encode(feats)
         lang, lang_prob = self._choose_language(enc)
-        # Dil bundan emin değilse bu parça muhtemelen konuşma değil (müzik/efekt)
+        # Very uncertain language usually means this isn't speech (music / sound effects)
         if lang_prob < self.min_lang_prob:
             return
         tok = self._tokenizer(lang)
@@ -324,21 +325,21 @@ class Transcriber(threading.Thread):
         text = tok.decode(tokens).strip()
         avg_logprob = result.scores[0] * len(tokens) / (len(tokens) + 1) if tokens else -9
         if result.no_speech_prob > 0.6 and avg_logprob < -0.8:
-            return  # konuşma yok
+            return  # no speech
         if self._compression_ratio(text) > 2.4:
-            return  # aynı şeyi tekrarlayan uydurma çıktı
+            return  # repetitive hallucination
         if not text or not re.search(r"\w", text) or HALLUCINATIONS.search(text):
             return
         dt = time.perf_counter() - t0
         if not partial and lang_prob >= 0.5:
             self.last_lang = lang
-        tag = f"ara {lang}" if partial else f"{lang} {lang_prob:.0%}"
+        tag = f"partial {lang}" if partial else f"{lang} {lang_prob:.0%}"
         log(f"[{tag}] ({dt:.2f}s) {text}")
         self.text_q.put((kind, lang, text))
 
 
 # --------------------------------------------------------------------------- #
-#  4) Çeviri — NLLB-200 (CTranslate2, CPU)
+#  4) Translation — NLLB-200 (CTranslate2)
 # --------------------------------------------------------------------------- #
 class Translator:
     def __init__(self, cfg: dict):
@@ -347,7 +348,7 @@ class Translator:
         from tokenizers import Tokenizer
 
         repo = cfg["translator_repo"]
-        log(f"Çeviri modeli yükleniyor: {repo} ({cfg['translator_device']}) ...")
+        log(f"Loading translation model: {repo} ({cfg['translator_device']}) ...")
         local = MODELS_DIR / repo.split("/")[-1]
         if (local / "model.bin").is_file() and (local / "tokenizer.json").is_file():
             path = str(local)
@@ -357,8 +358,8 @@ class Translator:
                 local_dir=str(local),
                 allow_patterns=["*.bin", "*.json", "*.txt"],
             )
-        # Not: sentencepiece yerine HF tokenizers kullanılıyor; Windows Akıllı Uygulama
-        # Denetimi sentencepiece'in DLL'ini engelliyor.
+        # HF `tokenizers` is used instead of `sentencepiece`, because Windows Smart App
+        # Control can block sentencepiece's native DLL.
         self.tok = Tokenizer.from_file(str(Path(path) / "tokenizer.json"))
         self.model = ctranslate2.Translator(
             path,
@@ -369,13 +370,13 @@ class Translator:
         )
         self.target = cfg["target_language"]
         self.beam = cfg.get("translator_beam_size", 4)
-        log("Çeviri modeli hazır.")
+        log("Translation model ready.")
 
     def translate(self, text: str, src_whisper_lang: str, beam: int | None = None) -> str:
         src = to_nllb(src_whisper_lang)
         if src == self.target:
             return text
-        # NLLB cümle düzeyinde en iyi çalışır: cümlelere böl, toplu çevir
+        # NLLB works best per sentence: split into sentences and translate as a batch
         sentences = [s for s in re.split(r"(?<=[.!?。！？])\s+", text) if s.strip()]
         batch = [
             [src] + self.tok.encode(s, add_special_tokens=False).tokens + ["</s>"]
@@ -392,7 +393,7 @@ class Translator:
         for r in results:
             ids = [self.tok.token_to_id(t) for t in r.hypotheses[0] if t != self.target]
             text_out = self.tok.decode([i for i in ids if i is not None], skip_special_tokens=True)
-            # NLLB bazen diyalog tiresi ekler ("- Teşekkür ederim.")
+            # NLLB sometimes prepends a dialogue dash ("- Thank you.")
             out.append(re.sub(r"^\s*[-–—]\s*", "", text_out))
         return " ".join(out).strip()
 
@@ -410,20 +411,20 @@ class TranslatorWorker(threading.Thread):
                 kind, lang, text = self.text_q.get(timeout=0.2)
             except queue.Empty:
                 continue
-            # Daha yeni bir metin bekliyorsa eski ara metni çevirmekle vakit kaybetme
+            # Don't waste time on a stale partial when newer text is already waiting
             if kind == "partial" and not self.text_q.empty():
                 continue
             t0 = time.perf_counter()
-            # Ara metin: hız için beam=1. Kesin metin: kalite için daha geniş beam.
+            # Partials: beam=1 for speed. Finals: wider beam for quality.
             partial = kind == "partial"
             key = (lang, text.strip().lower(), partial)
             if key == self.last_key:
-                tr = self.last_tr  # aynı metni tekrar çevirme
+                tr = self.last_tr  # same text as last time: don't translate again
             else:
                 try:
                     tr = self.tr.translate(text, lang, 1 if partial else None)
-                except Exception as e:  # çeviri hatası altyazıyı durdurmasın
-                    log("Çeviri hatası:", e)
+                except Exception as e:  # a translation error must not stop the subtitles
+                    log("Translation error:", e)
                     continue
                 self.last_key, self.last_tr = key, tr
             log(f"   -> ({time.perf_counter() - t0:.2f}s) {tr}")
@@ -431,7 +432,7 @@ class TranslatorWorker(threading.Thread):
 
 
 # --------------------------------------------------------------------------- #
-#  5) Altyazı penceresi — şeffaf, her zaman üstte, tıklamalar içinden geçer
+#  5) Subtitle window — transparent, always on top, click-through
 # --------------------------------------------------------------------------- #
 def run_overlay(cfg: dict, start_pipeline) -> int:
     from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
@@ -440,6 +441,8 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
         QApplication, QGraphicsDropShadowEffect, QLabel, QMenu, QStyle,
         QSystemTrayIcon, QVBoxLayout, QWidget,
     )
+
+    target_lang = nllb_to_whisper(cfg["target_language"])
 
     class Bridge(QObject):
         subtitle = pyqtSignal(str, str, str, bool)
@@ -487,7 +490,7 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
             screen = QApplication.primaryScreen().geometry()
             max_w = int(screen.width() * cfg["max_width_ratio"])
             self.label.setText(html)
-            # Kelime kaydırmalı etikette doğru yüksekliği genişliğe göre hesapla
+            # Compute the correct height of a word-wrapped label for the chosen width
             w = min(self.label.sizeHint().width(), max_w)
             h = self.label.heightForWidth(w)
             if h <= 0:
@@ -507,16 +510,16 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
 
             body = h.escape(translated)
             if not final:
-                # Konuşma sürüyor: ara metin, sonuna "…" ve biraz soluk renk
+                # Still speaking: partial text, slightly dimmer, ending with "…"
                 body = f"<span style='color:{cfg['partial_text_color']}'>{body.rstrip('.')}…</span>"
-            if cfg["show_language_tag"] and lang != "tr":
+            if cfg["show_language_tag"] and lang != target_lang:
                 body = f"<span style='font-size:{cfg['font_size'] // 2}pt; color:#bbb'>[{lang.upper()}]</span> " + body
-            if self.show_original and lang != "tr":
+            if self.show_original and lang != target_lang:
                 body += (
                     f"<br><span style='font-size:{int(cfg['font_size'] * 0.6)}pt; color:#ccc'>"
                     f"{h.escape(original)}</span>"
                 )
-            # Uzun cümleler daha uzun ekranda kalsın
+            # Keep long sentences on screen longer
             timeout = max(cfg["subtitle_timeout_seconds"], len(translated) / 15)
             self.show_text(body, timeout)
 
@@ -530,17 +533,17 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
     bridge.subtitle.connect(overlay.on_subtitle)
     bridge.status.connect(overlay.on_status)
 
-    # Sistem tepsisi menüsü
+    # System tray menu
     tray = QSystemTrayIcon(app.style().standardIcon(QStyle.StandardPixmap.SP_MediaVolume), app)
-    tray.setToolTip("Oyun Altyazı Çevirmeni")
+    tray.setToolTip("Live Subtitle Translator")
     menu = QMenu()
-    act_orig = QAction("Orijinal metni de göster", menu, checkable=True)
+    act_orig = QAction("Show original text", menu, checkable=True)
     act_orig.setChecked(overlay.show_original)
     act_orig.toggled.connect(lambda v: setattr(overlay, "show_original", v))
     paused = threading.Event()
-    act_pause = QAction("Duraklat", menu, checkable=True)
+    act_pause = QAction("Pause", menu, checkable=True)
     act_pause.toggled.connect(lambda v: paused.set() if v else paused.clear())
-    act_quit = QAction("Çıkış", menu)
+    act_quit = QAction("Quit", menu)
     act_quit.triggered.connect(app.quit)
     menu.addAction(act_orig)
     menu.addAction(act_pause)
@@ -553,7 +556,7 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
         if not paused.is_set():
             bridge.subtitle.emit(lang, original, translated, final)
 
-    # Ctrl+C ile konsoldan kapatabilmek için Python'a düzenli olarak kontrol ver
+    # Periodically hand control back to Python so Ctrl+C in the console works
     import signal
 
     signal.signal(signal.SIGINT, lambda *_: app.quit())
@@ -561,7 +564,7 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
     tick.start(300)
     tick.timeout.connect(lambda: None)
 
-    bridge.status.emit("Modeller yükleniyor…")
+    bridge.status.emit("Loading models…")
     stop_pipeline = start_pipeline(on_result, bridge.status.emit, app.quit)
     code = app.exec()
     stop_pipeline()
@@ -569,7 +572,7 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
 
 
 # --------------------------------------------------------------------------- #
-#  Ana akış
+#  Main
 # --------------------------------------------------------------------------- #
 def main() -> int:
     cfg = load_config()
@@ -592,14 +595,14 @@ def main() -> int:
                 transcriber.start()
                 segmenter.start()
                 capture.start()
-                log("Hazır! Oyundaki konuşmalar altyazıya çevriliyor. (Çıkmak için Ctrl+C veya tepsi menüsü)")
-                on_status("Altyazı hazır ✓")
+                log("Ready! Translating speech into subtitles. (Quit with Ctrl+C or the tray menu)")
+                on_status("Subtitles ready ✓")
             except Exception as e:
                 import traceback
 
                 traceback.print_exc()
-                log("Başlatma hatası:", e)
-                on_status(f"Hata: {e}")
+                log("Startup error:", e)
+                on_status(f"Error: {e}")
                 time.sleep(5)
                 on_fatal()
 

@@ -1,4 +1,4 @@
-# Modelleri Hugging Face'ten indirir (ilerleme çubuğuyla, yarıda kalırsa kaldığı yerden devam eder)
+# Downloads the models from Hugging Face (with a progress bar; resumes if interrupted)
 $ErrorActionPreference = "Stop"
 $models = Join-Path $PSScriptRoot "models"
 
@@ -18,10 +18,10 @@ foreach ($r in $repos) {
         for ($try = 1; $try -le 30; $try++) {
             curl.exe -L -C - --retry 5 --retry-delay 3 --retry-all-errors -o (Join-Path $dir $f) $url
             if ($LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 33) { break }
-            Write-Host "Baglanti koptu (curl $LASTEXITCODE), 3 sn sonra kaldigi yerden devam ($try/30)..." -ForegroundColor Yellow
+            Write-Host "Connection dropped (curl $LASTEXITCODE), resuming in 3 s ($try/30)..." -ForegroundColor Yellow
             Start-Sleep 3
         }
-        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 33) { throw "$f indirilemedi (curl $LASTEXITCODE)" }
+        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 33) { throw "Failed to download $f (curl $LASTEXITCODE)" }
     }
 }
-Write-Host "`nTUM MODELLER INDI" -ForegroundColor Green
+Write-Host "`nALL MODELS DOWNLOADED" -ForegroundColor Green

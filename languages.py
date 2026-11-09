@@ -1,4 +1,4 @@
-"""Whisper dil kodu -> NLLB-200 dil kodu eşlemesi."""
+"""Mapping from Whisper language codes to NLLB-200 language codes."""
 
 WHISPER_TO_NLLB = {
     "en": "eng_Latn", "zh": "zho_Hans", "de": "deu_Latn", "es": "spa_Latn",
@@ -28,6 +28,12 @@ WHISPER_TO_NLLB = {
     "yue": "yue_Hant",
 }
 
+NLLB_TO_WHISPER = {v: k for k, v in WHISPER_TO_NLLB.items()}
+
 
 def to_nllb(whisper_code: str) -> str:
     return WHISPER_TO_NLLB.get(whisper_code, "eng_Latn")
+
+
+def nllb_to_whisper(nllb_code: str) -> str:
+    return NLLB_TO_WHISPER.get(nllb_code, nllb_code)
