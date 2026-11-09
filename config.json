@@ -1,0 +1,39 @@
+{
+  "whisper_model": "models/faster-whisper-large-v3-turbo",
+  "whisper_device": "cuda",
+  "whisper_compute_type": "int8_float16",
+
+  "translator_repo": "JustFrederik/nllb-200-distilled-1.3B-ct2-int8",
+  "translator_device": "cuda",
+  "translator_compute_type": "int8_float16",
+  "translator_threads": 6,
+  "translator_beam_size": 4,
+  "whisper_beam_size": 3,
+
+  "partial_interval_seconds": 0.8,
+  "partial_min_seconds": 1.0,
+
+  "target_language": "tur_Latn",
+  "force_source_language": null,
+  "allowed_languages": [],
+  "min_language_probability": 0.3,
+
+  "vad_threshold": 0.5,
+  "min_silence_ms": 350,
+  "max_segment_seconds": 12,
+  "min_segment_seconds": 0.4,
+
+  "font_family": "Segoe UI",
+  "font_size": 28,
+  "text_color": "#FFFFFF",
+  "partial_text_color": "#D8D8D8",
+  "outline_color": "#000000",
+  "background_opacity": 0.45,
+  "bottom_margin_px": 90,
+  "max_width_ratio": 0.75,
+  "subtitle_timeout_seconds": 6,
+  "show_original": false,
+  "show_language_tag": true,
+
+  "output_device_name": null
+}
