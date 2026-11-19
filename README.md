@@ -22,7 +22,8 @@ Audio output (WASAPI loopback)
 - **Language stickiness.** Short or noisy clips don't make the detected language jump around. You can also limit detection to a few languages.
 - **Hallucination filtering.** Drops Whisper's well-known "Thanks for watching" and subtitle-credit lines on silence or music.
 - **Small footprint.** About 3 GB of VRAM and about 1 GB of RAM.
-- **Tray menu.** Show the original text, pause, or quit.
+- **Choose where subtitles appear.** Drag and resize the subtitle area on any monitor; it's remembered between runs.
+- **Tray menu.** Position subtitles, show the original text, pause, or quit.
 
 ## Requirements
 - Windows 10 or 11
@@ -48,6 +49,15 @@ Loading the models takes about 10 s. When "Subtitles ready ✓" appears, play so
 To quit, right-click the tray icon and choose **Quit**, or press Ctrl+C in the console.
 
 > **Games:** run them in **Borderless / Windowed** mode. Exclusive fullscreen draws over any overlay window.
+
+### Choosing where subtitles appear
+Right-click the tray icon and choose **Position subtitles…**, or double-click the tray icon. A dashed box appears with a sample subtitle:
+- **Drag inside** the box to move it; it works across multiple monitors.
+- **Drag an edge or corner** to resize it. Subtitles wrap to the box width and stay anchored to its bottom edge.
+- **Scroll** to change the font size.
+- **Enter** or **double-click** saves. **Esc** cancels.
+
+The position and font size are saved to `user_settings.json` and restored on the next start. **Reset position** in the tray menu goes back to the default bottom-centre placement. If a saved position is no longer on any screen (for example a monitor was unplugged), the default placement is used.
 
 ## Configuration (`config.json`)
 | Key | Default | Description |

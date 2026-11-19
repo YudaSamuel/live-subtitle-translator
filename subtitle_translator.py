@@ -51,9 +51,30 @@ def log(*args) -> None:
     print(time.strftime("[%H:%M:%S]"), *args, flush=True)
 
 
+USER_SETTINGS = ROOT / "user_settings.json"
+
+
 def load_config() -> dict:
+    """config.json, overridden by user_settings.json (what the user set from the tray menu)."""
     with open(ROOT / "config.json", encoding="utf-8") as f:
-        return json.load(f)
+        cfg = json.load(f)
+    try:
+        with open(USER_SETTINGS, encoding="utf-8") as f:
+            cfg.update(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return cfg
+
+
+def save_user_settings(**values) -> None:
+    try:
+        with open(USER_SETTINGS, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+    data.update(values)
+    with open(USER_SETTINGS, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
 
 # --------------------------------------------------------------------------- #
@@ -434,12 +455,12 @@ class TranslatorWorker(threading.Thread):
 # --------------------------------------------------------------------------- #
 #  5) Subtitle window — transparent, always on top, click-through
 # --------------------------------------------------------------------------- #
-def run_overlay(cfg: dict, start_pipeline) -> int:
-    from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
-    from PyQt6.QtGui import QAction, QColor, QFont
+def run_overlay(cfg: dict, start_pipeline, on_ui_ready=None) -> int:
+    from PyQt6.QtCore import QObject, QPoint, QRect, Qt, QTimer, pyqtSignal
+    from PyQt6.QtGui import QAction, QColor, QCursor, QFont, QPainter, QPen
     from PyQt6.QtWidgets import (
         QApplication, QGraphicsDropShadowEffect, QLabel, QMenu, QStyle,
-        QSystemTrayIcon, QVBoxLayout, QWidget,
+        QSystemTrayIcon, QWidget,
     )
 
     target_lang = nllb_to_whisper(cfg["target_language"])
@@ -447,6 +468,133 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
     class Bridge(QObject):
         subtitle = pyqtSignal(str, str, str, bool)
         status = pyqtSignal(str)
+
+    class AreaEditor(QWidget):
+        """A box the user drags/resizes to choose where subtitles appear.
+
+        Drag inside to move, drag an edge or corner to resize, scroll to change the
+        font size. Enter or double-click saves; Esc cancels.
+        """
+
+        EDGE = 12  # px from the border that counts as a resize handle
+        MIN_W, MIN_H = 200, 60
+
+        def __init__(self, rect: QRect, font_size: int, on_done):
+            super().__init__()
+            self.setWindowFlags(
+                Qt.WindowType.FramelessWindowHint
+                | Qt.WindowType.WindowStaysOnTopHint
+                | Qt.WindowType.Tool
+            )
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+            self.setMouseTracking(True)
+            self.setGeometry(rect)
+            self.font_size = font_size
+            self.on_done = on_done
+            self._drag_edges: tuple | None = None
+            self._press_global = QPoint()
+            self._press_geom = QRect()
+
+        def _edges_at(self, pos: QPoint) -> tuple:
+            e = self.EDGE
+            return (
+                pos.x() <= e,                      # left
+                pos.y() <= e,                      # top
+                pos.x() >= self.width() - e,       # right
+                pos.y() >= self.height() - e,      # bottom
+            )
+
+        def _cursor_for(self, edges: tuple):
+            left, top, right, bottom = edges
+            if (left and top) or (right and bottom):
+                return Qt.CursorShape.SizeFDiagCursor
+            if (right and top) or (left and bottom):
+                return Qt.CursorShape.SizeBDiagCursor
+            if left or right:
+                return Qt.CursorShape.SizeHorCursor
+            if top or bottom:
+                return Qt.CursorShape.SizeVerCursor
+            return Qt.CursorShape.SizeAllCursor
+
+        def paintEvent(self, _):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            r = self.rect().adjusted(1, 1, -2, -2)
+            p.fillRect(r, QColor(0, 0, 0, 110))
+            pen = QPen(QColor(255, 210, 0), 2, Qt.PenStyle.DashLine)
+            p.setPen(pen)
+            p.drawRect(r)
+            # Sample subtitle at the chosen font size, bottom-aligned like real subtitles
+            p.setPen(QColor(cfg["text_color"]))
+            p.setFont(QFont(cfg["font_family"], self.font_size, QFont.Weight.DemiBold))
+            p.drawText(
+                r.adjusted(10, 6, -10, -8),
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom | Qt.TextFlag.TextWordWrap,
+                "Örnek altyazı / Sample subtitle",
+            )
+            p.setPen(QColor(255, 210, 0))
+            p.setFont(QFont(cfg["font_family"], 10))
+            p.drawText(
+                r.adjusted(10, 6, -10, -6),
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
+                f"Drag to move · drag edges to resize · scroll: font size ({self.font_size}) · "
+                "Enter / double-click: save · Esc: cancel",
+            )
+
+        def mousePressEvent(self, ev):
+            if ev.button() == Qt.MouseButton.LeftButton:
+                self._drag_edges = self._edges_at(ev.position().toPoint())
+                self._press_global = ev.globalPosition().toPoint()
+                self._press_geom = QRect(self.geometry())
+
+        def mouseMoveEvent(self, ev):
+            if self._drag_edges is None:
+                self.setCursor(QCursor(self._cursor_for(self._edges_at(ev.position().toPoint()))))
+                return
+            d = ev.globalPosition().toPoint() - self._press_global
+            g = QRect(self._press_geom)
+            left, top, right, bottom = self._drag_edges
+            if not any(self._drag_edges):
+                g.translate(d)
+            else:
+                if left:
+                    g.setLeft(min(g.left() + d.x(), g.right() - self.MIN_W))
+                if right:
+                    g.setRight(max(g.right() + d.x(), g.left() + self.MIN_W))
+                if top:
+                    g.setTop(min(g.top() + d.y(), g.bottom() - self.MIN_H))
+                if bottom:
+                    g.setBottom(max(g.bottom() + d.y(), g.top() + self.MIN_H))
+            # Keep the box on the desktop (across all monitors)
+            desk = QRect()
+            for s in QApplication.screens():
+                desk = desk.united(s.geometry())
+            g.setWidth(min(g.width(), desk.width()))
+            g.setHeight(min(g.height(), desk.height()))
+            g.moveLeft(max(desk.left(), min(g.left(), desk.right() + 1 - g.width())))
+            g.moveTop(max(desk.top(), min(g.top(), desk.bottom() + 1 - g.height())))
+            self.setGeometry(g)
+
+        def mouseReleaseEvent(self, _):
+            self._drag_edges = None
+
+        def mouseDoubleClickEvent(self, _):
+            self._finish(save=True)
+
+        def wheelEvent(self, ev):
+            step = 1 if ev.angleDelta().y() > 0 else -1
+            self.font_size = max(10, min(72, self.font_size + step))
+            self.update()
+
+        def keyPressEvent(self, ev):
+            if ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._finish(save=True)
+            elif ev.key() == Qt.Key.Key_Escape:
+                self._finish(save=False)
+
+        def _finish(self, save: bool):
+            self.close()
+            self.on_done(QRect(self.geometry()) if save else None, self.font_size)
 
     class Overlay(QWidget):
         def __init__(self):
@@ -465,7 +613,11 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
             self.label.setWordWrap(True)
             self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.label.setTextFormat(Qt.TextFormat.RichText)
-            self.label.setFont(QFont(cfg["font_family"], cfg["font_size"], QFont.Weight.DemiBold))
+            self.font_size = cfg["font_size"]
+            self.label.setFont(QFont(cfg["font_family"], self.font_size, QFont.Weight.DemiBold))
+            # User-chosen subtitle area [x, y, w, h] in screen coordinates (None = default)
+            a = cfg.get("subtitle_area")
+            self.area = QRect(*a) if a and len(a) == 4 else None
             self.label.setStyleSheet(
                 f"color: {cfg['text_color']};"
                 f"background-color: rgba(0,0,0,{alpha});"
@@ -477,30 +629,57 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
             shadow.setColor(QColor(cfg["outline_color"]))
             self.label.setGraphicsEffect(shadow)
 
-            lay = QVBoxLayout(self)
-            lay.setContentsMargins(0, 0, 0, 0)
-            lay.addWidget(self.label)
-
+            # No layout on purpose: a layout keeps the window's minimum size from the
+            # previous (longer) subtitle, which left a big empty box on screen.
             self.hide_timer = QTimer(self)
             self.hide_timer.setSingleShot(True)
             self.hide_timer.timeout.connect(self.hide)
             self.show_original = cfg["show_original"]
 
-        def show_text(self, html: str, timeout_s: float) -> None:
+        def default_area(self) -> QRect:
+            """Bottom-centre band of the primary screen (used until the user picks one)."""
             screen = QApplication.primaryScreen().geometry()
-            max_w = int(screen.width() * cfg["max_width_ratio"])
-            self.label.setText(html)
-            # Compute the correct height of a word-wrapped label for the chosen width
-            w = min(self.label.sizeHint().width(), max_w)
-            h = self.label.heightForWidth(w)
-            if h <= 0:
-                h = self.label.sizeHint().height()
-            self.label.setFixedSize(w, h)
-            self.setGeometry(
+            w = int(screen.width() * cfg["max_width_ratio"])
+            h = max(120, self.font_size * 5)
+            return QRect(
                 screen.x() + (screen.width() - w) // 2,
                 screen.y() + screen.height() - h - cfg["bottom_margin_px"],
                 w, h,
             )
+
+        def current_area(self) -> QRect:
+            if not self.area:
+                return self.default_area()
+            # If the saved area is no longer on any screen (monitor unplugged,
+            # resolution changed), fall back to the default instead of hiding subtitles
+            if QApplication.screenAt(self.area.center()) is None:
+                return self.default_area()
+            return QRect(self.area)
+
+        def set_font_size(self, size: int) -> None:
+            self.font_size = size
+            self.label.setFont(QFont(cfg["font_family"], size, QFont.Weight.DemiBold))
+
+        def show_text(self, html: str, timeout_s: float) -> None:
+            area = self.current_area()
+            self.label.setText(html)
+            # Compute the correct height of a word-wrapped label for the area's width
+            self.label.setMinimumSize(0, 0)
+            self.label.setMaximumSize(16777215, 16777215)
+            # Use the text's natural single-line width, capped at the area width
+            # (a word-wrapped QLabel's sizeHint would pick a narrow "pleasant" width)
+            self.label.setWordWrap(False)
+            natural_w = self.label.sizeHint().width()
+            self.label.setWordWrap(True)
+            w = min(natural_w, area.width())
+            h = self.label.heightForWidth(w)
+            if h <= 0:
+                h = self.label.sizeHint().height()
+            self.label.setGeometry(0, 0, w, h)
+            # Size the window exactly to the text: centred horizontally, anchored to the
+            # bottom of the area (text grows upwards)
+            self.setFixedSize(w, h)
+            self.move(area.x() + (area.width() - w) // 2, area.bottom() + 1 - h)
             self.show()
             self.raise_()
             self.hide_timer.start(int(timeout_s * 1000))
@@ -513,10 +692,10 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
                 # Still speaking: partial text, slightly dimmer, ending with "…"
                 body = f"<span style='color:{cfg['partial_text_color']}'>{body.rstrip('.')}…</span>"
             if cfg["show_language_tag"] and lang != target_lang:
-                body = f"<span style='font-size:{cfg['font_size'] // 2}pt; color:#bbb'>[{lang.upper()}]</span> " + body
+                body = f"<span style='font-size:{self.font_size // 2}pt; color:#bbb'>[{lang.upper()}]</span> " + body
             if self.show_original and lang != target_lang:
                 body += (
-                    f"<br><span style='font-size:{int(cfg['font_size'] * 0.6)}pt; color:#ccc'>"
+                    f"<br><span style='font-size:{int(self.font_size * 0.6)}pt; color:#ccc'>"
                     f"{h.escape(original)}</span>"
                 )
             # Keep long sentences on screen longer
@@ -524,7 +703,7 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
             self.show_text(body, timeout)
 
         def on_status(self, msg: str) -> None:
-            self.show_text(f"<span style='font-size:{cfg['font_size'] // 2 + 4}pt'>{msg}</span>", 4)
+            self.show_text(f"<span style='font-size:{self.font_size // 2 + 4}pt'>{msg}</span>", 4)
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -545,11 +724,57 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
     act_pause.toggled.connect(lambda v: paused.set() if v else paused.clear())
     act_quit = QAction("Quit", menu)
     act_quit.triggered.connect(app.quit)
+
+    # Choosing where subtitles appear
+    editor_ref: dict = {}
+
+    def on_area_chosen(rect, font_size):
+        editor_ref.pop("w", None)
+        if rect is None:  # cancelled: keep everything as it was
+            return
+        overlay.set_font_size(font_size)
+        overlay.area = rect
+        save_user_settings(
+            subtitle_area=[rect.x(), rect.y(), rect.width(), rect.height()],
+            font_size=font_size,
+        )
+        log(f"Subtitle area saved: {rect.x()},{rect.y()} {rect.width()}x{rect.height()}, font {font_size}")
+        overlay.on_status("Position saved ✓")
+
+    def open_area_editor():
+        if "w" in editor_ref:
+            editor_ref["w"].activateWindow()
+            return
+        overlay.hide()
+        ed = AreaEditor(overlay.current_area(), overlay.font_size, on_area_chosen)
+        editor_ref["w"] = ed
+        ed.show()
+        ed.raise_()
+        ed.activateWindow()
+        ed.setFocus()
+
+    def reset_area():
+        overlay.area = None
+        save_user_settings(subtitle_area=None)
+        overlay.on_status("Position reset to default")
+
+    act_area = QAction("Position subtitles…", menu)
+    act_area.triggered.connect(open_area_editor)
+    act_reset = QAction("Reset position", menu)
+    act_reset.triggered.connect(reset_area)
+    menu.addAction(act_area)
+    menu.addAction(act_reset)
+    menu.addSeparator()
     menu.addAction(act_orig)
     menu.addAction(act_pause)
     menu.addSeparator()
     menu.addAction(act_quit)
     tray.setContextMenu(menu)
+    # Double-clicking the tray icon also opens the position editor
+    tray.activated.connect(
+        lambda reason: open_area_editor()
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None
+    )
     tray.show()
 
     def on_result(lang, original, translated, final=True):
@@ -566,6 +791,10 @@ def run_overlay(cfg: dict, start_pipeline) -> int:
 
     bridge.status.emit("Loading models…")
     stop_pipeline = start_pipeline(on_result, bridge.status.emit, app.quit)
+    if on_ui_ready:  # used by tests to drive the UI
+        on_ui_ready(dict(app=app, overlay=overlay, editor=editor_ref,
+                         open_area_editor=open_area_editor, reset_area=reset_area,
+                         on_result=on_result))
     code = app.exec()
     stop_pipeline()
     return code
